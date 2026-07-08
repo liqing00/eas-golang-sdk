@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"sync/atomic"
 	"time"
 )
@@ -206,23 +207,81 @@ func (p *PredictClient) SetCompressType(compressType string) {
 	p.compressType = compressType
 }
 
+// CallOption configures a single Predict call.
+type CallOption func(*callConfig)
+
+type callConfig struct {
+	queryParams url.Values
+	requestPath string
+}
+
+// WithQueryParams sets query parameters for a single Predict call.
+func WithQueryParams(params url.Values) CallOption {
+	return func(c *callConfig) {
+		c.queryParams = params
+	}
+}
+
+// WithQueryParam adds a single query parameter for a single Predict call.
+func WithQueryParam(key, value string) CallOption {
+	return func(c *callConfig) {
+		if c.queryParams == nil {
+			c.queryParams = url.Values{}
+		}
+		c.queryParams.Add(key, value)
+	}
+}
+
+// WithRequestPath overrides the request path for a single Predict call.
+func WithRequestPath(requestPath string) CallOption {
+	return func(c *callConfig) {
+		if len(requestPath) > 0 && requestPath[0] != '/' {
+			requestPath = "/" + requestPath
+		}
+		c.requestPath = requestPath
+	}
+}
+
+// requestURI builds the request URI (path + query string) used in both URL
+// construction and signature generation. Per-request requestPath overrides
+// the client default; query params are appended when present.
+func (c *callConfig) requestURI(serviceName, defaultPath string) string {
+	path := defaultPath
+	if c != nil && c.requestPath != "" {
+		path = c.requestPath
+	}
+	uri := fmt.Sprintf("/api/predict/%s%s", serviceName, path)
+	if c != nil && len(c.queryParams) > 0 {
+		uri = uri + "?" + c.queryParams.Encode()
+	}
+	return uri
+}
+
+func newCallConfig(opts []CallOption) *callConfig {
+	cfg := &callConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	return cfg
+}
+
 func (p *PredictClient) tryNext(host string) string {
 	return p.endpoint.TryNext(host)
 }
 
-func (p *PredictClient) createUrl(host string) string {
+func (p *PredictClient) createUrl(host string, cfg *callConfig) string {
 	if len(p.serviceName) != 0 {
 		if p.serviceName[len(p.serviceName)-1] == '/' {
 			p.serviceName = p.serviceName[:len(p.serviceName)-1]
 		}
 	}
-	return fmt.Sprintf("http://%s/api/predict/%s%s", host, p.serviceName, p.requestPath)
+	return fmt.Sprintf("http://%s%s", host, cfg.requestURI(p.serviceName, p.requestPath))
 }
 
 // generateSignature computes the signature header using the access token with hmac sha1 algorithm.
 // returns the headers including signature header for authentication.
-func (p *PredictClient) generateSignature(requestData []byte) map[string]string {
-	canonicalizedResource := fmt.Sprintf("/api/predict/%s%s", p.serviceName, p.requestPath)
+func (p *PredictClient) generateSignature(requestData []byte, cfg *callConfig) map[string]string {
+	canonicalizedResource := cfg.requestURI(p.serviceName, p.requestPath)
 	contentMd5 := md5sum(requestData)
 	contentType := "application/octet-stream"
 	currentTime := time.Now().Format("Mon, 02 Jan 2006 15:04:05 GMT")
@@ -242,7 +301,7 @@ func (p *PredictClient) generateSignature(requestData []byte) map[string]string 
 
 // BytesPredict send the raw request data in byte array through http connections,
 // retry the request automatically when an error occurs
-func (p *PredictClient) BytesPredict(requestData []byte) ([]byte, error) {
+func (p *PredictClient) BytesPredict(requestData []byte, opts ...CallOption) ([]byte, error) {
 	var err error
 	if len(p.compressType) > 0 {
 		requestData, err = compress(requestData, p.compressType)
@@ -251,8 +310,9 @@ func (p *PredictClient) BytesPredict(requestData []byte) ([]byte, error) {
 		}
 	}
 
+	cfg := newCallConfig(opts)
 	host := p.tryNext("")
-	headers := p.generateSignature(requestData)
+	headers := p.generateSignature(requestData, cfg)
 	for i := 0; i <= p.retryCount; i++ {
 		if i != 0 {
 			host = p.tryNext(host)
@@ -263,7 +323,7 @@ func (p *PredictClient) BytesPredict(requestData []byte) ([]byte, error) {
 				fmt.Sprintf("No available endpoint found for service: %v", p.serviceName))
 		}
 
-		url := p.createUrl(host)
+		url := p.createUrl(host, cfg)
 
 		req, err := http.NewRequest("POST", url, bytes.NewReader(requestData))
 		if err != nil {
@@ -327,12 +387,12 @@ type Response interface {
 }
 
 // Predict for request
-func (p *PredictClient) Predict(request Request) (Response, error) {
+func (p *PredictClient) Predict(request Request, opts ...CallOption) (Response, error) {
 	req, err2 := request.ToString()
 	if err2 != nil {
 		return nil, err2
 	}
-	body, err := p.BytesPredict([]byte(req))
+	body, err := p.BytesPredict([]byte(req), opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -356,14 +416,14 @@ func (p *PredictClient) Predict(request Request) (Response, error) {
 }
 
 // StringPredict function send input data and return predicted result
-func (p *PredictClient) StringPredict(str string) (string, error) {
-	body, err := p.BytesPredict([]byte(str))
+func (p *PredictClient) StringPredict(str string, opts ...CallOption) (string, error) {
+	body, err := p.BytesPredict([]byte(str), opts...)
 	return string(body), err
 }
 
 // TorchPredict function send input data and return PyTorch predicted result
-func (p *PredictClient) TorchPredict(request TorchRequest) (*TorchResponse, error) {
-	resp, err := p.Predict(request)
+func (p *PredictClient) TorchPredict(request TorchRequest, opts ...CallOption) (*TorchResponse, error) {
+	resp, err := p.Predict(request, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -371,8 +431,8 @@ func (p *PredictClient) TorchPredict(request TorchRequest) (*TorchResponse, erro
 }
 
 // TorchRecPredict function send input data and return TorchRec predicted result
-func (p *PredictClient) TorchRecPredict(request TorchRecRequest) (*TorchRecResponse, error) {
-	resp, err := p.Predict(request)
+func (p *PredictClient) TorchRecPredict(request TorchRecRequest, opts ...CallOption) (*TorchRecResponse, error) {
+	resp, err := p.Predict(request, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -380,8 +440,8 @@ func (p *PredictClient) TorchRecPredict(request TorchRecRequest) (*TorchRecRespo
 }
 
 // TFPredict function send input data and return TensorFlow predicted result
-func (p *PredictClient) TFPredict(request TFRequest) (*TFResponse, error) {
-	resp, err := p.Predict(request)
+func (p *PredictClient) TFPredict(request TFRequest, opts ...CallOption) (*TFResponse, error) {
+	resp, err := p.Predict(request, opts...)
 	if err != nil {
 		return nil, err
 	}
